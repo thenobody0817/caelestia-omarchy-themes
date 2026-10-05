@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""List the installed Omarchy themes as JSON, for Caelestia's Colours page.
+
+The page in the forked shell (modules/nexus/pages/wallandstyle/ColourSelect.qml)
+reads this. Output is a JSON array, alphabetical by slug:
+
+    [{"slug": "hackerman", "name": "Hackerman", "mode": "dark",
+      "accent": "82FB9C", "preview": "/usr/share/omarchy/themes/hackerman/preview.png",
+      "current": true}, ...]
+
+Names are rendered the same way `omarchy-theme-current` renders the current one,
+so the label in the shell matches what `omarchy theme current` prints.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+USER_THEMES = HOME / ".config/omarchy/themes"
+SYSTEM_THEMES = Path("/usr/share/omarchy/themes")
+THEME_NAME_FILE = HOME / ".local/state/omarchy/current/theme.name"
+
+PREVIEW_NAMES = ("preview.png", "preview.jpg", "preview.jpeg", "preview.webp", "preview.gif", "preview.bmp")
+KEY_RE = re.compile(r"^\s*([a-z_]+)\s*=\s*(.+?)\s*$")
+
+
+def display_name(slug: str) -> str:
+    """'tokyo-night' -> 'Tokyo Night', matching omarchy-theme-current."""
+    return " ".join(word[:1].upper() + word[1:] for word in slug.split("-"))
+
+
+def find_preview(theme_dir: Path) -> str | None:
+    for name in PREVIEW_NAMES:
+        candidate = theme_dir / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def read_field(colors_toml: Path, field: str) -> str | None:
+    if not colors_toml.is_file():
+        return None
+    for line in colors_toml.read_text(errors="replace").splitlines():
+        match = KEY_RE.match(line)
+        if match and match.group(1) == field:
+            return match.group(2).strip().strip('"').strip("'")
+    return None
+
+
+def theme_dirs() -> dict[str, Path]:
+    """slug -> directory, user copies winning over system ones."""
+    found: dict[str, Path] = {}
+    for base in (SYSTEM_THEMES, USER_THEMES):
+        if not base.is_dir():
+            continue
+        for entry in base.iterdir():
+            if entry.is_dir() and (entry / "colors.toml").is_file():
+                found[entry.name] = entry
+    return found
+
+
+def main() -> int:
+    current = THEME_NAME_FILE.read_text().strip() if THEME_NAME_FILE.is_file() else ""
+
+    themes = []
+    for slug, directory in sorted(theme_dirs().items()):
+        colors_toml = directory / "colors.toml"
+        accent = read_field(colors_toml, "accent") or "#000000"
+        themes.append(
+            {
+                "slug": slug,
+                "name": display_name(slug),
+                "mode": read_field(colors_toml, "mode") or "dark",
+                "accent": accent.lstrip("#")[:6].upper(),
+                "preview": find_preview(directory),
+                "current": slug == current,
+            }
+        )
+
+    json.dump(themes, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

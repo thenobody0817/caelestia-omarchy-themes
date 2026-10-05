@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = caelestia-shell
+
+[Action]
+Description = Re-applying the Omarchy Colours page to the Caelestia shell...
+When = PostTransaction
+Exec = /usr/bin/su -l @USER@ -c "@HOME@/.local/bin/sync-caelestia-shell --restart"

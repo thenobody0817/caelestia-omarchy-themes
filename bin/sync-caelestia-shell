@@ -1,0 +1,66 @@
+#!/bin/bash
+# Re-sync the forked Caelestia shell from the packaged copy and re-apply the
+# local Omarchy Colours page.
+#
+# The shell is loaded from the first of ~/.config/quickshell/caelestia or
+# /etc/xdg/quickshell/caelestia that exists, and Quickshell does not merge them
+# -- so the fork is a full copy. A caelestia-shell upgrade replaces the packaged
+# tree, and this pulls the new copy in and re-applies the one file we change.
+#
+# Run it after any caelestia-shell update (a pacman hook does this
+# automatically when installed).
+
+set -euo pipefail
+
+RESTART=false
+for arg in "$@"; do
+  case $arg in
+    --restart) RESTART=true ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+SRC=/etc/xdg/quickshell/caelestia
+DST="$HOME/.config/quickshell/caelestia"
+OVERLAY="$HOME/.local/share/caelestia-shell-overlay"
+
+if [[ ! -d $SRC ]]; then
+  echo "no packaged Caelestia shell at $SRC" >&2
+  exit 1
+fi
+if [[ ! -d $OVERLAY ]]; then
+  echo "no overlay at $OVERLAY" >&2
+  exit 1
+fi
+
+mkdir -p "$DST"
+rsync -a --delete "$SRC/" "$DST/"
+rsync -a "$OVERLAY/" "$DST/"
+
+echo "synced $DST (packaged $SRC + overlay $OVERLAY)"
+
+# Quickshell does not auto-reload this config (shell.qml sets
+# settings.watchFiles: false), so pick up the new copy by restarting.
+if $RESTART; then
+  # Target the caelestia instance specifically: `qs` is also the process name
+  # for other Quickshell configurations (e.g. voxtype's overlay), and a plain
+  # `pgrep -x qs` can pick the wrong one.
+  pid="$(pgrep -f -- 'qs -c caelestia' | head -1 || true)"
+  if [[ -n $pid ]]; then
+    # Take the live session environment from the process being replaced. A
+    # login shell or a pacman hook has no WAYLAND_DISPLAY, XDG_RUNTIME_DIR or
+    # Hyprland signature, and without them the new shell cannot start.
+    envfile="$(mktemp)"
+    tr '\0' '\n' < "/proc/$pid/environ" \
+      | grep -E '^(WAYLAND_DISPLAY|XDG_RUNTIME_DIR|HYPRLAND_INSTANCE_SIGNATURE|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP|XDG_SESSION_ID|QT_QPA_PLATFORM)=' \
+      > "$envfile" || true
+
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -x qs >/dev/null 2>&1 || break; sleep 0.1; done
+
+    # shellcheck disable=SC2046
+    env $(cat "$envfile") qs -c caelestia -d >/dev/null 2>&1 || true
+    rm -f "$envfile"
+    echo "restarted the shell"
+  fi
+fi
