@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Push the current Omarchy theme into Caelestia, wherever Caelestia reads it.
+#
+# Omarchy runs everything in ~/.config/omarchy/hooks/theme-set.d/ after a theme
+# has been staged, passing the slug in $1. This project's whole reason for
+# existing is that hook: stock Omarchy knows nothing about Caelestia, so without
+# this the Omarchy theme changes and the shell, Hyprland's colours, GTK apps and
+# wallpaper all stay on whatever they booted with.
+#
+# The slug in $1 is deliberately ignored. By the time hooks run, the theme is
+# already staged at ~/.local/state/omarchy/current/, and the bridge reads that
+# -- which is the same source `omarchy-theme-set` used, so there is no way for
+# this to apply a stale theme than the one just set.
+#
+# Never fail: a broken hook would abort the rest of Omarchy's theme-set chain,
+# which is a far worse outcome than a missed recolor. Every step is best-effort.
+
+set -u
+
+BRIDGE="$HOME/.local/bin/caelestia-theme-bridge"
+[[ -x $BRIDGE ]] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+
+# Caelestia's Hyprland layer is loaded from the shell session's own tree when
+# that exists, and from ~/.config/hypr otherwise. Only the former needs the
+# scheme redirected; both get the CLI scheme, which is what caelestia-shell's
+# Colours singleton watches, so the bar follows the theme too.
+TARGET_DIR=()
+if [[ -d $HOME/.config/caelestia-session/dots/hypr ]]; then
+  TARGET_DIR=(--target-dir "$HOME/.config/caelestia-session/dots/hypr")
+fi
+
+# The GTK/Thunar stylesheets are written regardless of Caelestia being
+# installed: they are global, and they must be readable in a plain Omarchy
+# session too.
+python3 "$BRIDGE" "${TARGET_DIR[@]}" --emit-cli-scheme >/dev/null 2>&1 || exit 0
+
+# Hyprland needs an explicit reload to re-read scheme/current.lua; the shell
+# picks the new scheme.json up through its own file watcher.
+command -v hyprctl >/dev/null 2>&1 && hyprctl reload >/dev/null 2>&1
+
+exit 0

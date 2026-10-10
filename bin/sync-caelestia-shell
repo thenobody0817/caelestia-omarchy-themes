@@ -23,6 +23,7 @@ done
 SRC=/etc/xdg/quickshell/caelestia
 DST="$HOME/.config/quickshell/caelestia"
 OVERLAY="$HOME/.local/share/caelestia-shell-overlay"
+BACKUP_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia-shell-backup"
 
 if [[ ! -d $SRC ]]; then
   echo "no packaged Caelestia shell at $SRC" >&2
@@ -31,6 +32,48 @@ fi
 if [[ ! -d $OVERLAY ]]; then
   echo "no overlay at $OVERLAY" >&2
   exit 1
+fi
+
+# --- drift check -------------------------------------------------------------
+# Clobbering $DST is correct: it is a regenerated build artifact, not a user
+# config directory (see the header). But this script is normally driven by a
+# root pacman hook, and there a silent delete is indistinguishable from data
+# loss -- so anything about to be lost is copied out first.
+#
+# `rsync --dry-run --itemize-changes` reports exactly the paths that would
+# change, which is far easier to filter than parsing `diff -rq` output. Paths the
+# overlay owns are dropped: a difference on one of those is this project
+# re-applying its own file, not someone's hand-edit.
+declare -a drift=()
+if [[ -d $DST ]]; then
+  overlay_owned=$(cd "$OVERLAY" && find . -type f | sed 's|^\./||')
+  while IFS= read -r line; do
+    path=${line##* }
+    path=${path%/}
+    [[ -n $path && $path != . ]] || continue
+    # Only real files carry content worth saving; directory entries and paths
+    # already deleted do not.
+    [[ -f $DST/$path ]] || continue
+    grep -qxF -- "$path" <<<"$overlay_owned" && continue
+    drift+=("$path")
+  done < <(rsync -a --delete --dry-run --itemize-changes "$SRC/" "$DST/" 2>/dev/null)
+fi
+
+if (( ${#drift[@]} )); then
+  backup="$BACKUP_ROOT/$(date +%Y%m%dT%H%M%S)"
+  for path in "${drift[@]}"; do
+    install -Dm644 "$DST/$path" "$backup/$path"
+  done
+  echo "note: ${#drift[@]} local file(s) under $DST differ from the package and"
+  echo "      are being replaced. Your copies are kept in:"
+  echo "        $backup"
+  for path in "${drift[@]:0:10}"; do
+    printf '          %s\n' "$path"
+  done
+  if (( ${#drift[@]} > 10 )); then
+    printf '          ... and %d more\n' "$(( ${#drift[@]} - 10 ))"
+  fi
+  echo
 fi
 
 mkdir -p "$DST"

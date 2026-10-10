@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""Bridge Omarchy theme colours into Caelestia's scheme files.
+
+Caelestia's Hyprland layer reads colours from exactly one place --
+hypr/scheme/current.lua -- and only three files consume it:
+  hypr/variables.lua        active/inactive window border, shadow
+  hypr/hyprland/misc.lua    empty-desktop background
+  hypr/hyprland/group.lua   workspace-group text and borders
+
+Everything else in the config is colourless, so that one table is the whole
+theming surface. We fill it from Omarchy's staged colors.toml.
+
+The mapping is pass-through, not palette generation. Both systems use the same
+semantic names, so a value that means "background" in Omarchy means
+"background" in Caelestia. That is why one script covers all 27 installed
+themes, light and dark, without special cases.
+
+It also writes GTK's stylesheets (~/.config/gtk-3.0 and gtk-4.0, gtk.css and
+thunar.css) from the same palette. Caelestia's own CLI used to own those, but it
+paints them from its palette, not Omarchy's, so they went stale on every Omarchy
+theme switch -- and the Omarchy base theme is plain Adwaita-dark, whose widgets
+read @theme_* names the Caelestia template never defined. The result was Thunar's
+light-grey text over a themed background. This bridge writes both name sets and
+pins the text colours, so Thunar follows the Omarchy theme and stays readable.
+
+It also bridges the wallpaper. omarchy-theme-set rotates a theme's backgrounds
+and points ~/.local/state/omarchy/current/background at the winner; Caelestia's
+shell draws from ~/.local/state/caelestia/wallpaper/path.txt, which nothing here
+used to update, so a theme switch left the stock wallpaper up. Writing that file
+(from the Omarchy symlink, only when it belongs to the theme just set) lets the
+shell's own watcher switch it live, with no shell restart.
+
+usage:
+  caelestia-theme-bridge [--dry-run] [--theme NAME] [--emit-cli-scheme]
+                  [--wallpaper-only] [--no-wallpaper] [--no-gtk]
+
+  --dry-run          print the mapping, write nothing
+  --theme NAME       bridge that theme instead of the current one
+  --emit-cli-scheme  also write ~/.local/state/caelestia/scheme.json, which
+                     caelestia-shell's Colours singleton watches (services/
+                     Colours.qml: path `${Paths.state}/scheme.json`). Verified:
+                     the shell reloads the palette the moment that file
+                     changes. The emitted palette is completed from Caelestia's
+                     own scheme for the theme's mode, so the shell gets every
+                     key it reads, not just the ones Hyprland does.
+  --wallpaper-only   only sync Caelestia's wallpaper to the current theme's
+                     background; touch no colours. Used at session start.
+  --no-wallpaper     do not touch the wallpaper.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+STAGED = HOME / ".local/state/omarchy/current/theme/colors.toml"
+THEME_NAME_FILE = HOME / ".local/state/omarchy/current/theme.name"
+THEME_DIRS = [HOME / ".config/omarchy/themes", Path("/usr/share/omarchy/themes")]
+HYPR_SCHEME = HOME / ".config/hypr/scheme/current.lua"
+HYPR_DEFAULT = HOME / ".config/hypr/scheme/default.lua"
+HYPR_VARS = HOME / ".config/caelestia/hypr-vars.lua"
+CLI_SCHEME = HOME / ".local/state/caelestia/scheme.json"
+
+# Where a Caelestia shell can live. This -- not the scheme directory -- is the
+# "is Caelestia installed" probe: creating hypr/scheme/ is part of this script's
+# job, so on a first run the directory is absent and testing it would make a
+# fresh install look like a machine without Caelestia, and silently do nothing.
+CAELESTIA_SHELL_DIRS = (
+    HOME / ".config/quickshell/caelestia",
+    Path("/etc/xdg/quickshell/caelestia"),
+)
+
+# GTK apps (Thunar is GTK3) read colour from these two files. Caelestia's own
+# CLI writes them from its palette, not Omarchy's, so they went stale on every
+# Omarchy theme switch; the bridge rewrites them from the palette below instead.
+GTK_VERSIONS = ("gtk-3.0", "gtk-4.0")
+
+# Caelestia's wallpaper state. The shell watches path.txt with a FileView
+# (services/Wallpapers.qml), so writing it switches the wallpaper live.
+OMARCHY_BACKGROUND_LINK = HOME / ".local/state/omarchy/current/background"
+CAEL_WALL = HOME / ".local/state/caelestia/wallpaper"
+CAEL_WALL_PATH = CAEL_WALL / "path.txt"
+CAEL_WALL_LINK = CAEL_WALL / "current"
+CAEL_WALL_THUMB = CAEL_WALL / "thumbnail.jpg"
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+
+# Keys with no direct counterpart in Omarchy's palette. Kept so the emitted
+# table is complete for anything that reads it later.
+CATPPUCCIN_FALLBACK = {
+    "rosewater": "light_foreground", "flamingo": "light_foreground",
+    "pink": "magenta", "mauve": "magenta", "red": "red", "maroon": "red",
+    "peach": "orange", "yellow": "yellow", "green": "green", "teal": "cyan",
+    "sky": "cyan", "sapphire": "blue", "blue": "blue", "lavender": "magenta",
+    "primary_paletteKeyColor": "accent", "secondary_paletteKeyColor": "cyan",
+    "tertiary_paletteKeyColor": "magenta", "neutral_paletteKeyColor": "muted",
+    "neutral_variant_paletteKeyColor": "muted",
+}
+TERM_MAP = {
+    "term0": "background", "term1": "red", "term2": "green", "term3": "yellow",
+    "term4": "blue", "term5": "magenta", "term6": "cyan", "term7": "foreground",
+    "term8": "dark_foreground", "term9": "bright_red", "term10": "bright_green",
+    "term11": "bright_yellow", "term12": "bright_blue", "term13": "bright_magenta",
+    "term14": "bright_cyan", "term15": "bright_foreground",
+}
+CATPPUCCIN_CORE = {
+    "text": "foreground", "subtext1": "light_foreground",
+    "subtext0": "dark_foreground", "overlay2": "dark_foreground",
+    "overlay1": "muted", "overlay0": "darker_background",
+    "surface2": "lighter_background", "surface1": "muted",
+    "surface0": "selection", "base": "background", "mantle": "dark_background",
+    "crust": "darker_background",
+    "success": "green", "onSuccess": "background",
+    "successContainer": "green", "onSuccessContainer": "background",
+    "shadow": None, "scrim": None,
+}
+
+
+def parse_colors(path: Path) -> dict[str, str]:
+    """Every key -> raw value.
+
+    Values are kept verbatim, not just hex ones: hyprland_active_border holds an
+    rgba() gradient string that has to reach Hyprland unchanged.
+    """
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(errors="replace").splitlines():
+        m = re.match(r"^\s*([a-z_]+)\s*=\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def theme_dir(name: str) -> Path | None:
+    for base in THEME_DIRS:
+        candidate = base / name / "colors.toml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def normalise(value: str | None) -> str | None:
+    """'#82FB9C' -> '82FB9C'. Returns None for anything unusable."""
+    if not value:
+        return None
+    v = value.strip().lstrip("#")
+    if len(v) == 3:
+        v = "".join(c * 2 for c in v)
+    if len(v) >= 6 and re.fullmatch(r"[0-9a-fA-F]{6,8}", v):
+        return v[:6].upper()
+    return None
+
+
+def mix(a: str, b: str, ratio: float) -> str:
+    """Blend two 6-hex colours; ratio 0 = a, 1 = b."""
+    ca = [int(a[i:i + 2], 16) for i in (0, 2, 4)]
+    cb = [int(b[i:i + 2], 16) for i in (0, 2, 4)]
+    return "".join(f"{round(ca[i] * (1 - ratio) + cb[i] * ratio):02X}" for i in range(3))
+
+
+def load_default_keys() -> dict[str, str]:
+    """Caelestia's own default scheme as key -> value.
+
+    Used to fill any key we don't derive, so the emitted table is complete and
+    nothing reads as nil if a later Caelestia version reads more of them.
+    """
+    if not HYPR_DEFAULT.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for line in HYPR_DEFAULT.read_text(errors="replace").splitlines():
+        m = re.match(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([0-9A-Fa-f]{3,8})"', line)
+        if m:
+            out[m.group(1)] = m.group(2).upper()
+    return out
+
+
+def default_scheme_dirs() -> list[Path]:
+    """Where Caelestia keeps its bundled schemes, across Python versions."""
+    dirs: list[Path] = []
+    try:
+        import caelestia  # noqa: PLC0415
+
+        dirs.append(Path(caelestia.__file__).parent / "data" / "schemes")
+    except Exception:
+        pass
+    dirs += sorted(Path("/usr/lib").glob("python*/site-packages/caelestia/data/schemes"))
+    return [d for d in dirs if d.is_dir()]
+
+
+def caelestia_templates_dir() -> Path | None:
+    """Caelestia's bundled templates (gtk.css, thunar.css), across Python versions.
+
+    The Thunar layout is taken from there rather than re-written here, so the
+    styling stays whatever Caelestia ships; only its colours are ours.
+    """
+    try:
+        import caelestia  # noqa: PLC0415
+
+        d = Path(caelestia.__file__).parent / "data" / "templates"
+        if d.is_dir():
+            return d
+    except Exception:
+        pass
+    for d in sorted(Path("/usr/lib").glob("python*/site-packages/caelestia/data/templates")):
+        if d.is_dir():
+            return d
+    return None
+
+
+def fill_template(template: Path, values: dict[str, str]) -> str:
+    """Replace Caelestia's `{{ $name }}` placeholders with '#rrggbb' values."""
+    text = template.read_text()
+    for name, value in values.items():
+        text = text.replace("{{ $" + name + " }}", f"#{value}")
+    return text
+
+
+def render_gtk_css(scheme: dict[str, str], theme_name: str) -> str:
+    """gtk.css for the current Omarchy theme.
+
+    Two name sets, deliberately:
+
+    * libadwaita's (`window_bg_color`, ...) for GTK4 and for GTK3 under
+      adw-gtk3, which is what Caelestia's own template defines;
+    * plain GTK3 Adwaita's (`theme_bg_color`, `theme_fg_color`, ...), because
+      Omarchy runs stock Adwaita-dark and its widgets read only those names.
+
+    Defining just the first set is the invisible-Thunar bug: thunar.css paints a
+    themed background, Adwaita-dark keeps drawing its own light-grey foreground,
+    and the two never meet.
+    """
+
+    def g(key: str, fallback: str = "000000") -> str:
+        value = scheme.get(key)
+        return value if value else fallback
+
+    background = g("background")
+    surface = g("surface", background)
+    surface_dim = g("surfaceDim", background)
+    container_low = g("surfaceContainerLow", background)
+    on_surface = g("onSurface", "FFFFFF")
+    primary = g("primary", "C2C1FF")
+    on_primary = g("onPrimary", background)
+    outline = g("outline", on_surface)
+
+    return f"""/* Generated by caelestia-theme-bridge from the Omarchy theme "{theme_name}" -- do not edit. */
+
+/* libadwaita / adw-gtk3 names (GTK4, and GTK3 when adw-gtk3 is the base theme) */
+@define-color accent_color #{primary};
+@define-color accent_bg_color #{primary};
+@define-color accent_fg_color #{on_primary};
+@define-color window_bg_color #{background};
+@define-color window_fg_color #{on_surface};
+@define-color headerbar_bg_color #{surface_dim};
+@define-color headerbar_fg_color #{on_surface};
+@define-color popover_bg_color #{surface_dim};
+@define-color popover_fg_color #{on_surface};
+@define-color view_bg_color #{surface};
+@define-color view_fg_color #{on_surface};
+@define-color card_bg_color #{container_low};
+@define-color card_fg_color #{on_surface};
+@define-color sidebar_bg_color @window_bg_color;
+@define-color sidebar_fg_color @window_fg_color;
+@define-color sidebar_border_color @window_bg_color;
+@define-color sidebar_backdrop_color @window_bg_color;
+
+/* Plain GTK3 Adwaita names -- the ones an Omarchy GTK app actually reads. */
+@define-color theme_bg_color #{background};
+@define-color theme_fg_color #{on_surface};
+@define-color theme_base_color #{surface};
+@define-color theme_text_color #{on_surface};
+@define-color theme_selected_bg_color alpha(@accent_color, 0.25);
+@define-color theme_selected_fg_color @accent_color;
+@define-color insensitive_bg_color #{background};
+@define-color insensitive_base_color #{surface};
+@define-color insensitive_fg_color alpha(@theme_fg_color, 0.5);
+@define-color theme_unfocused_bg_color #{background};
+@define-color theme_unfocused_base_color #{surface};
+@define-color theme_unfocused_fg_color #{on_surface};
+@define-color theme_unfocused_text_color #{on_surface};
+@define-color theme_unfocused_selected_bg_color alpha(@accent_color, 0.25);
+@define-color theme_unfocused_selected_fg_color @accent_color;
+@define-color borders #{outline};
+@define-color unfocused_borders #{outline};
+@define-color hint_fg_color alpha(@theme_fg_color, 0.5);
+
+@import "thunar.css";
+"""
+
+
+def render_thunar_css(scheme: dict[str, str]) -> str:
+    """Caelestia's Thunar layout, filled from the Omarchy palette.
+
+    The layout is reused verbatim; only an explicit `color` is appended, so text
+    can never inherit a base theme's foreground that does not match the themed
+    background thunar.css just painted.
+    """
+    templates = caelestia_templates_dir()
+    if templates is None or not (templates / "thunar.css").is_file():
+        return ""
+    css = fill_template(templates / "thunar.css", scheme)
+    on_surface = scheme.get("onSurface") or "FFFFFF"
+    primary = scheme.get("primary") or on_surface
+    css += f"""
+/* Safety net: pin the text colours, so a themed background can never sit under
+   a base theme's mismatched foreground (the invisible-Thunar bug). */
+.thunar,
+.thunar .sidebar .view,
+.thunar .frame.standard-view .view,
+.thunar statusbar {{
+    color: #{on_surface};
+}}
+
+.thunar .sidebar .view:selected,
+.thunar .frame.standard-view .view *:selected {{
+    color: #{primary};
+}}
+"""
+    return css
+
+
+def apply_gtk(scheme: dict[str, str], theme_name: str) -> list[Path]:
+    """Write gtk-3.0/gtk-4.0 gtk.css + thunar.css from the Omarchy palette."""
+    thunar_css = render_thunar_css(scheme)
+    if not thunar_css:
+        print("gtk     : Caelestia thunar.css template not found -- skipped")
+        return []
+    gtk_css = render_gtk_css(scheme, theme_name)
+    written: list[Path] = []
+    for version in GTK_VERSIONS:
+        target = HOME / ".config" / version
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "gtk.css").write_text(gtk_css)
+        (target / "thunar.css").write_text(thunar_css)
+        written.append(target / "gtk.css")
+    return written
+
+
+def read_colours_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(errors="replace").splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2 and parts[0].strip():
+            out[parts[0].strip()] = parts[1].strip().lstrip("#")
+    return out
+
+
+def base_palette(mode: str) -> dict[str, str]:
+    """A complete Caelestia scheme for the given mode, used to fill gaps.
+
+    The shell's Colours singleton reads far more keys than Hyprland does
+    (primaryFixed, onErrorContainer, ...). Deriving them all from an Omarchy
+    colors.toml would be palette generation; instead we start from Caelestia's
+    own palette and overwrite the keys the theme actually speaks to.
+    """
+    flavour = "latte" if mode == "light" else "mocha"
+    for base in default_scheme_dirs():
+        colours = read_colours_file(base / "catppuccin" / flavour / f"{mode}.txt")
+        if colours:
+            return colours
+    return {}
+
+
+def pick(colors: dict[str, str], *names: str) -> tuple[str | None, str | None]:
+    """First usable value among names. Returns (value, source_key)."""
+    for n in names:
+        v = normalise(colors.get(n))
+        if v:
+            return v, n
+    return None, None
+
+
+def build(colors: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (scheme table, notes describing fallbacks that fired)."""
+    notes: dict[str, str] = {}
+
+    bg, bg_key = pick(colors, "background")
+    if not bg:
+        raise SystemExit("theme has no usable 'background'")
+    fg, _ = pick(colors, "foreground")
+    accent, accent_key = pick(colors, "accent")
+    if not accent:
+        accent, accent_key = normalise("#c2c1ff"), "hardcoded (no accent)"
+        notes["primary"] = "no accent in theme, using Caelestia default"
+    muted, _ = pick(colors, "muted", "selection")
+    dark_bg, _ = pick(colors, "darker_background", "dark_background")
+    mid_bg, _ = pick(colors, "dark_background")
+    lite_bg, _ = pick(colors, "lighter_background")
+    if not mid_bg:
+        mid_bg, _ = mix(bg, fg, 0.06), "derived"
+    if not lite_bg:
+        lite_bg, _ = mix(bg, fg, 0.12), "derived"
+    if not dark_bg:
+        dark_bg, _ = mix(bg, "000000", 0.4), "derived"
+    dim_fg, _ = pick(colors, "dark_foreground", "muted")
+    lite_fg, _ = pick(colors, "light_foreground", "foreground")
+    if not dim_fg:
+        dim_fg, _ = mix(fg, bg, 0.45), "derived"
+    if not lite_fg:
+        lite_fg = fg
+    if not muted:
+        muted, _ = mix(bg, fg, 0.25), "derived"
+
+    scheme: dict[str, str] = {
+        # --- the keys hypr actually reads ---
+        "primary": accent,                    # active border (overridable in hypr-vars)
+        "onSurfaceVariant": lite_fg,          # inactive border
+        "inversePrimary": mix(accent, "000000", 0.55),  # shadow at 10% alpha
+        "surfaceContainer": bg,               # empty-desktop background
+        "onSurface": fg,
+        "background": bg,
+        "onBackground": fg,
+        "surface": bg,
+        "surfaceDim": dark_bg,
+        "surfaceBright": lite_bg,
+        "surfaceContainerLowest": dark_bg,
+        "surfaceContainerLow": mid_bg,
+        "surfaceContainerHigh": mix(bg, fg, 0.18),
+        "surfaceContainerHighest": lite_bg,
+        "inverseSurface": fg,
+        "inverseOnSurface": bg,
+        "outline": muted,
+        "outlineVariant": mix(muted, bg, 0.5),
+        "surfaceVariant": muted,
+        "surfaceTint": accent,
+        "onPrimary": bg,
+        "primaryContainer": accent,
+        "onPrimaryContainer": bg,
+        "secondary": normalise(colors.get("cyan")) or accent,
+        "onSecondary": bg,
+        "secondaryContainer": normalise(colors.get("cyan")) or accent,
+        "onSecondaryContainer": bg,
+        "tertiary": normalise(colors.get("magenta")) or accent,
+        "onTertiary": bg,
+        "tertiaryContainer": normalise(colors.get("magenta")) or accent,
+        "onTertiaryContainer": bg,
+        "error": normalise(colors.get("red")) or "FFB4AB",
+        "onError": bg,
+        "errorContainer": normalise(colors.get("red")) or "93000A",
+        "onErrorContainer": bg,
+    }
+
+    # Catppuccin-style extras, best-effort, so nothing reads as undefined.
+    for dest, src in {**CATPPUCCIN_FALLBACK, **CATPPUCCIN_CORE, **TERM_MAP}.items():
+        if dest in scheme:
+            continue
+        if src is None:
+            scheme[dest] = "000000"
+            continue
+        v = normalise(colors.get(src))
+        if not v:
+            v = {"orange": "cyan", "brown": "green", "selection": muted,
+                 "background": bg, "dark_background": mid_bg,
+                 "darker_background": dark_bg, "lighter_background": lite_bg,
+                 "foreground": fg, "dark_foreground": dim_fg,
+                 "light_foreground": lite_fg, "muted": muted}.get(src, bg)
+            notes.setdefault(dest, f"{src} missing, derived")
+        scheme[dest] = v
+
+    # Every Catppuccin consumer expects these, but a plain Omarchy theme often
+    # omits them, and CATPPUCCIN_FALLBACK only maps *into* other names -- "orange"
+    # is a source there, never a destination. term2/term6 are always filled by
+    # this point, so borrow from the colour next door.
+    if not normalise(colors.get("orange")):
+        notes["orange"] = "theme lacks orange, using cyan"
+        scheme["orange"] = scheme["term6"]
+    if not normalise(colors.get("brown")):
+        notes["brown"] = "theme lacks brown, using green"
+        scheme["brown"] = scheme["term2"]
+
+    # Fill anything we didn't derive from Caelestia's own defaults, so the file
+    # is a complete scheme rather than a partial one.
+    for key, value in load_default_keys().items():
+        if key not in scheme:
+            scheme[key] = value
+            notes.setdefault(key, "carried from caelestia default")
+
+    notes["source_background"] = bg_key or "background"
+    notes["source_accent"] = accent_key or "accent"
+    return scheme, notes
+
+
+def render_lua(scheme: dict[str, str]) -> str:
+    lines = [
+        "-- Generated by caelestia-theme-bridge -- DO NOT EDIT BY HAND.",
+        "--",
+        "-- Source: the current Omarchy theme's colors.toml. Regenerated on every",
+        "-- theme switch by ~/.config/omarchy/hooks/theme-set.d/caelestia-bridge.",
+        "--",
+        "-- Only keys that Caelestia's hypr config actually reads are mapped; the",
+        "-- remainder are carried over from its default scheme so nothing is",
+        "-- undefined if a later version reads more of them.",
+        "",
+        "return {",
+    ]
+    for key in sorted(scheme):
+        lines.append(f'    {key:<30} = "{scheme[key]}",')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+# Hyprland 0.56 rejects a gradient written as a single string
+# ("rgba(a) rgba(b) 45deg"); it wants a structured value instead:
+#     { colors = { "rgba(a)", "rgba(b)" }, angle = 45 }
+# which is the form Omarchy's own default/hypr/looknfeel.lua already uses.
+#
+# The angle is optional on the way in: some themes (Nord among them) write a
+# gradient as just "rgba(a) rgba(b)" with no angle, and that is still a gradient
+# -- treating it as a plain colour produces a quoted string that Hyprland then
+# rejects at config parse time.
+COLOUR = r"(?:#[0-9A-Fa-f]{3,8}|(?:rgba?|rgbx?)\([^)]*\))"
+GRADIENT_RE = re.compile(
+    rf"^\s*(?P<stops>{COLOUR}(?:\s+{COLOUR})+)(?:\s+(?P<angle>-?\d+)\s*(?:deg|\u00b0)?)?\s*$"
+)
+DEFAULT_GRADIENT_ANGLE = 45
+OMARCHY_LOOKNFEEL = Path("/usr/share/omarchy/default/hypr/looknfeel.lua")
+OMARCHY_GRADIENT_RE = re.compile(
+    r"active_border_color\s*=\s*\{\s*colors\s*=\s*\{([^}]*)\}\s*,\s*angle\s*=\s*(-?\d+)"
+)
+
+
+def hypr_colour(value: str) -> str:
+    """Render one colour for Hyprland's Lua config, translating gradients."""
+    m = GRADIENT_RE.match(value)
+    if m:
+        stops = ", ".join(f'"{s}"' for s in m.group("stops").split())
+        angle = m.group("angle") or DEFAULT_GRADIENT_ANGLE
+        return f"{{ colors = {{ {stops} }}, angle = {angle} }}"
+    return f'"{value}"'
+
+
+def omarchy_default_active_border() -> str | None:
+    """Omarchy's own window border gradient, as a Lua value.
+
+    looknfeel.lua never reads colors.toml, so that gradient is what the user
+    sees on their Omarchy desktop regardless of theme. Reusing it verbatim
+    keeps the trial comparable instead of inventing a themed border Omarchy
+    would never render.
+    """
+    try:
+        m = OMARCHY_GRADIENT_RE.search(OMARCHY_LOOKNFEEL.read_text())
+    except OSError:
+        return None
+    if not m:
+        return None
+    # The capture already contains quoted strings ("rgba(a)", "rgba(b)"), so
+    # pull the colour out of each pair instead of wrapping the text again --
+    # doing that yields ""rgba(a)"" and Lua rejects it.
+    stops = re.findall(r'"([^"]+)"', m.group(1))
+    if not stops:
+        return None
+    quoted = ", ".join(f'"{s}"' for s in stops)
+    return f"{{ colors = {{ {quoted} }}, angle = {m.group(2)} }}"
+
+
+def border_overrides(colors: dict[str, str]) -> tuple[str | None, str | None, list[str]]:
+    """(active, inactive, notes), already rendered as Hyprland Lua values."""
+    notes: list[str] = []
+    raw_active = colors.get("hyprland_active_border") or colors.get("active_border_color")
+    raw_inactive = colors.get("hyprland_inactive_border")
+    if raw_active:
+        active = hypr_colour(raw_active)
+        notes.append("active border: from theme, gradient translated to table form")
+    else:
+        active = omarchy_default_active_border()
+        if active:
+            notes.append("active border: theme defines none, reusing Omarchy's own gradient")
+        else:
+            accent, _ = pick(colors, "accent")
+            active = hypr_colour(accent)
+            notes.append("active border: no theme value and no Omarchy default, using accent")
+    if raw_inactive:
+        inactive = hypr_colour(raw_inactive)
+        notes.append("inactive border: explicit from theme")
+    else:
+        fg, fg_key = pick(colors, "foreground")
+        bg, _ = pick(colors, "background")
+        if fg and bg:
+            inactive = f'"rgba({mix(fg, bg, 0.88)}88)"'
+        notes.append(f"inactive border: theme defines none, derived from {fg_key}")
+    return active, inactive, notes
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "omarchy"
+
+
+def omarchy_background(theme_name: str) -> Path | None:
+    """The background Omarchy picked for this theme, or None.
+
+    omarchy-theme-set rotates a theme's backgrounds and points
+    ~/.local/state/omarchy/current/background at the winner. Nothing renders
+    that in this session (omarchy-shell is not running), so it is ours to read.
+
+    The target must still sit under the theme that was just set. With
+    OMARCHY_THEME_SKIP_BACKGROUND the symlink is left on the previous theme,
+    and following it blindly would put the wrong image up.
+    """
+    link = OMARCHY_BACKGROUND_LINK
+    if not link.exists() and not link.is_symlink():
+        return None
+    try:
+        resolved = link.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_file() or resolved.suffix.lower() not in IMAGE_SUFFIXES:
+        return None
+    for base in (HOME / ".config/omarchy/backgrounds" / theme_name,
+                 HOME / ".local/state/omarchy/current/theme/backgrounds"):
+        try:
+            resolved.relative_to(base)
+        except ValueError:
+            continue
+        return resolved
+    return None
+
+
+def write_background_thumbnail(background: Path) -> None:
+    """Keep the thumbnail symlink on the image that is up.
+
+    Nothing in caelestia-shell reads it today (the Nexus page lists the
+    wallpapers directory), but Caelestia's own state keeps one and leaving it on
+    the previous image is the kind of stale that bites later.
+    """
+    CAEL_WALL_THUMB.unlink(missing_ok=True)
+    CAEL_WALL_THUMB.symlink_to(background)
+
+
+def set_caelestia_wallpaper(background: Path) -> None:
+    CAEL_WALL.mkdir(parents=True, exist_ok=True)
+
+    try:
+        current = CAEL_WALL_PATH.read_text().strip()
+    except OSError:
+        current = ""
+
+    # A plain write, not an atomic rename: the shell watches this file, and a
+    # rename swaps the inode. Caelestia's own `wallpaper -f` writes it the same
+    # way. Skipped when unchanged so the watcher does not fire needlessly.
+    if current != str(background):
+        CAEL_WALL_PATH.write_text(str(background))
+
+    CAEL_WALL_LINK.unlink(missing_ok=True)
+    CAEL_WALL_LINK.symlink_to(background)
+    write_background_thumbnail(background)
+
+
+def sync_wallpaper(theme_name: str, dry_run: bool = False) -> None:
+    background = omarchy_background(theme_name)
+    if background is None:
+        print("wallpaper: no background for this theme -- skipped")
+        return
+    if not dry_run:
+        set_caelestia_wallpaper(background)
+    print(f"wallpaper: {background}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--theme", help="bridge this theme instead of the current one")
+    ap.add_argument("--target-dir",
+                    help="write scheme/current.lua into this tree instead of "
+                         "~/.config/hypr (use for the trial session)")
+    ap.add_argument("--emit-cli-scheme", action="store_true",
+                    help="also write ~/.local/state/caelestia/scheme.json, the "
+                         "palette caelestia-shell watches")
+    ap.add_argument("--wallpaper-only", action="store_true",
+                    help="only sync Caelestia's wallpaper to the current "
+                         "theme's background; write no colours")
+    ap.add_argument("--no-wallpaper", action="store_true",
+                    help="do not touch Caelestia's wallpaper")
+    ap.add_argument("--no-gtk", action="store_true",
+                    help="do not regenerate the GTK/Thunar stylesheets")
+    args = ap.parse_args()
+
+    # Where scheme/current.lua goes. The trial session runs from its own tree,
+    # so the bridge must write there or Hyprland would read the in-place copy.
+    # default.lua follows the same target, otherwise the "fill any missing keys
+    # from Caelestia's defaults" step silently finds nothing and emits a partial
+    # scheme.
+    global HYPR_SCHEME, HYPR_DEFAULT
+    if args.target_dir:
+        root = Path(args.target_dir).expanduser()
+        HYPR_SCHEME = root / "scheme" / "current.lua"
+        HYPR_DEFAULT = root / "scheme" / "default.lua"
+
+    theme_name = args.theme or (THEME_NAME_FILE.read_text().strip() if THEME_NAME_FILE.is_file() else "?")
+    theme_slug = slugify(theme_name)
+
+    # Session-start path: the wallpaper is the only thing that can drift while
+    # this session is not running (a theme set from the Omarchy desktop updates
+    # the Omarchy symlink but never touches Caelestia's).
+    if args.wallpaper_only:
+        sync_wallpaper(theme_slug, args.dry_run)
+        return 0
+
+    src = theme_dir(theme_name) or STAGED
+    colors = parse_colors(src)
+    if not colors:
+        print(f"error: no colours found in {src}", file=sys.stderr)
+        return 1
+
+    scheme, notes = build(colors)
+    active, inactive, border_notes = border_overrides(colors)
+
+    print(f"theme   : {theme_name}")
+    print(f"source  : {src}")
+    print(f"keys    : {len(scheme)}")
+    print(f"bg      : {scheme['surfaceContainer']}   accent: {scheme['primary']}   fg: {scheme['onSurface']}")
+    print(f"border  : active={active}")
+    print(f"          inactive={inactive}")
+    for n in border_notes:
+        print(f"          note: {n}")
+    for k, v in sorted(notes.items()):
+        if not k.startswith("source_"):
+            print(f"fallback: {k}: {v}")
+
+    if args.dry_run:
+        print("\ndry run -- nothing written")
+        return 0
+
+    # GTK stylesheets are global, not Caelestia state, so they are written
+    # whether or not Caelestia itself is installed -- Thunar must be readable in
+    # a plain Omarchy session too.
+    if not args.no_gtk:
+        print()
+        for path in apply_gtk(scheme, theme_name):
+            print(f"wrote   : {path}")
+
+    if not any(d.is_dir() for d in CAELESTIA_SHELL_DIRS):
+        print(f"\nNo Caelestia shell found ({CAELESTIA_SHELL_DIRS[0]} or "
+              f"{CAELESTIA_SHELL_DIRS[1]}) -- nothing to apply.")
+        return 0
+
+    HYPR_SCHEME.parent.mkdir(parents=True, exist_ok=True)
+    HYPR_SCHEME.write_text(render_lua(scheme))
+    print(f"\nwrote   : {HYPR_SCHEME}")
+
+    if active or inactive:
+        HYPR_VARS.parent.mkdir(parents=True, exist_ok=True)
+        body = [
+            "-- Generated by caelestia-theme-bridge -- DO NOT EDIT BY HAND.",
+            "-- Values are Lua, not bare strings: Hyprland 0.56 needs the table",
+            "-- form for gradients and rejects \"rgba(a) rgba(b) 45deg\".",
+            "return {",
+        ]
+        if active:
+            body.append(f"    activeWindowBorderColour   = {active},")
+        if inactive:
+            body.append(f"    inactiveWindowBorderColour = {inactive},")
+        body.append("}")
+        HYPR_VARS.write_text("\n".join(body) + "\n")
+        print(f"wrote   : {HYPR_VARS}")
+
+    if args.emit_cli_scheme:
+        mode = "light" if colors.get("mode", "").strip().lower() == "light" else "dark"
+        colours = base_palette(mode)
+        colours.update({k: str(v).upper() for k, v in scheme.items() if v})
+        payload = {"name": theme_slug, "flavour": "omarchy", "mode": mode,
+                   "variant": "tonalspot", "colours": colours}
+        CLI_SCHEME.parent.mkdir(parents=True, exist_ok=True)
+        CLI_SCHEME.write_text(json.dumps(payload, indent=4) + "\n")
+        print(f"wrote   : {CLI_SCHEME}  ({mode}, {len(colours)} keys)")
+
+    # Not the CLI's `wallpaper -f`: that would regenerate a palette from the
+    # image (clobbering the one above) and write Hyprland's scheme file outside
+    # this session's tree, and it fails outright on the name/flavour above, for
+    # which no colours file exists. The state files are the whole surface.
+    if not args.no_wallpaper:
+        sync_wallpaper(theme_slug)
+
+    print("\nRun: hyprctl reload   (and restart the shell if it is Caelestia's)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
