@@ -103,17 +103,21 @@ if [[ -x $BIN/caelestia-theme-bridge ]]; then
   # Regression: on a fresh install ~/.config/hypr/scheme/ does not exist yet, and
   # creating it is the bridge's own job. It must not mistake that absence for
   # "Caelestia is not installed" and skip every Caelestia-specific write.
-  if [[ -d /etc/xdg/quickshell/caelestia ]]; then
+  #
+  # Use a *system* theme here: the sandbox has its own empty HOME, so a theme
+  # installed under ~/.config/omarchy/themes would be invisible to it.
+  system_theme=$(find /usr/share/omarchy/themes -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort | head -1)
+  if [[ -z $system_theme ]]; then
+    skip "bridge bootstrap (no system themes to test against)"
+  else
     fresh=$(mktemp -d)
     out=$(env -u XDG_STATE_HOME HOME="$fresh" "$BIN/caelestia-theme-bridge" \
-            --emit-cli-scheme --theme "${THEMES[0]}" 2>&1); rc=$?
-    maybe "fresh install, no hypr/scheme: exits 0" "[[ $rc -eq 0 ]]"
+            --emit-cli-scheme --theme "$system_theme" 2>&1); rc=$?
+    maybe "fresh install, no hypr/scheme ($system_theme): exits 0" "[[ $rc -eq 0 ]]"
     maybe "fresh install: creates hypr/scheme/current.lua" \
           "[[ -f $fresh/.config/hypr/scheme/current.lua ]]"
     maybe "fresh install: seeds the shell's scheme.json" \
           "[[ -f $fresh/.local/state/caelestia/scheme.json ]]"
-  else
-    skip "bridge bootstrap (no packaged Caelestia)"
   fi
 else
   skip "bridge (binary missing)"

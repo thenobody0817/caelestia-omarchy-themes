@@ -107,6 +107,39 @@ note: 50 local file(s) under ~/.config/quickshell/caelestia differ from the pack
 If you have been editing the shell tree directly, revert those edits from the
 backup after each upgrade, or keep them in a dotfiles repo and re-apply.
 
+## Where this fits
+
+Omarchy is the single source of theme truth. This project is only one of its
+consumers. `omarchy-theme-set` runs everything in
+`~/.config/omarchy/hooks/theme-set.d/`, and each hook there adapts one app to the
+new palette — independently, and in parallel:
+
+```mermaid
+flowchart TD
+    A["omarchy-theme-set THEME"] --> B["omarchy-hook theme-set"]
+    B --> C["~/.config/omarchy/hooks/theme-set.d/*"]
+    C --> D["caelestia-bridge<br/>(this project)"]
+    C --> E["openchamber-theme-hook.sh"]
+    C --> F["zen-omarchy-theme"]
+    C --> G["spotifast-theme"]
+    D --> H["Hyprland scheme, GTK, wallpaper, shell bar"]
+    E --> I["OpenChamber theme"]
+    F --> J["Zen browser mod"]
+    G --> K["Spotifast theme"]
+```
+
+Nothing here is layered on anything else. Caelestia has no idea your browser is
+also being themed, and your browser has no idea about Caelestia — they are
+siblings, not steps. That is why one switch turns everything green at once, and
+why removing one hook changes exactly one app's behaviour.
+
+This repository is **only the Caelestia half**. It themes the shell, Hyprland's
+borders and background, the wallpaper, and — through the GTK stylesheets — GTK
+apps like Thunar. It does **not** theme your browser, your music player, or any
+app that keeps its own palette rather than reading GTK or Hyprland's. If you want
+another app to follow, you add it to the hooks directory above; you do not extend
+this project. That directory is the extension point, and it is the whole idea.
+
 ## Two things to know
 
 **GTK is co-owned.** Caelestia's own CLI writes `gtk.css` and `thunar.css` too,
