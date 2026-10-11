@@ -86,12 +86,32 @@ done
 ((${#themes[@]})) || die "no theme given; run '$0 --list' or '--help'"
 
 # Remember where we started from, so a failed run or a Ctrl-C still restores it.
+# A shell trap covers INT/TERM/EXIT, but not SIGKILL -- which is exactly how an
+# agent's tool call gets cancelled. So the theme is also stamped to a state file
+# before the first switch, and any later run restores from that stamp and removes
+# it. That way an interrupted capture heals itself on the next one rather than
+# leaving the desktop on whatever theme it happened to be killed on.
+STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia-capture-theme"
+
+if [[ -f $STATE_FILE ]]; then
+  leftover=$(<"$STATE_FILE")
+  if [[ -n $leftover ]] && [[ $leftover != "$(cat "$HOME"/.local/state/omarchy/current/theme.name 2>/dev/null)" ]]; then
+    echo "note: a previous capture was interrupted while on '$leftover' -- restoring that now"
+    omarchy-theme-set "$leftover" >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  rm -f "$STATE_FILE"
+fi
+
 current=$(cat "$HOME"/.local/state/omarchy/current/theme.name 2>/dev/null || true)
 restore() {
   if $RESTORE && [[ -n $current ]]; then
     omarchy-theme-set "$current" >/dev/null 2>&1 || true
   fi
+  rm -f "$STATE_FILE"
 }
+mkdir -p "$(dirname "$STATE_FILE")"
+printf '%s\n' "$current" > "$STATE_FILE"
 trap restore EXIT
 
 mkdir -p "$OUT"

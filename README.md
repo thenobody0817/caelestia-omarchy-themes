@@ -13,6 +13,16 @@ On a stock install, Caelestia's Colours page (*Nexus → Wallpaper & style → C
 is a "Page under construction" stub. This replaces it with a grid of the Omarchy
 themes installed on your machine, each with its preview and accent.
 
+## Screenshots
+
+The Caelestia bar under four Omarchy themes, left to right: **Hackerman**,
+**Nord**, **Synthwave**, **Matte Black**. One bar, one session, four theme
+switches — this is what the bridge is for.
+
+![The Caelestia bar under four Omarchy themes: Hackerman, Nord, Synthwave and Matte Black](docs/bar-comparison.png)
+
+To reproduce these against your own themes, see `tools/capture-theme.sh`.
+
 ## What one theme switch touches
 
 | | |
@@ -168,6 +178,22 @@ Checks the things that can be checked without a live Wayland session: that the
 JSON the page reads is well-formed, that the bridge's `--dry-run` writes nothing
 and reports a scheme for both light and dark themes, and that the sync's drift
 detection backs up edited files while ignoring the overlay's own.
+
+## Regenerating the screenshots
+
+```sh
+./tools/capture-theme.sh --bar --prefix bar hackerman nord synthwave matte-black
+```
+
+Switches each theme in turn, waits for the shell to pick it up, captures with
+`grim`, and restores the theme you started from. `--list` prints what is
+installed, `--full` captures the whole output instead of a crop, and
+`--geometry G` takes any `x,y WxH` region.
+
+It is safe to interrupt. The theme you started from is stamped to
+`~/.local/state/` before the first switch, so a hard kill cannot leave your
+desktop on whichever theme it happened to be killed on — the next run notices the
+stamp and restores it first.
 
 ## Credits
 
